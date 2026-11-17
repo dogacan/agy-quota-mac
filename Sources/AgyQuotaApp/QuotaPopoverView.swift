@@ -66,8 +66,19 @@ struct QuotaPopoverView: View {
                 .padding(.vertical, 10)
         }
         .frame(width: 380, height: 500)
+        .background(
+            PopoverVisibilityObserver { isVisible in
+                viewModel.setPopoverVisible(isVisible)
+            }
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        )
         .onAppear {
             NSApp.activate()
+        }
+        .onDisappear {
+            viewModel.setPopoverVisible(false)
         }
     }
 
@@ -484,5 +495,121 @@ private enum QuotaColors {
             return .orange
         }
         return .red
+    }
+}
+
+/// Bridges `MenuBarExtra(.window)` hosting panel visibility to SwiftUI without relying on `.onDisappear`.
+private struct PopoverVisibilityObserver: NSViewRepresentable {
+    let onVisibilityChange: @MainActor (Bool) -> Void
+
+    func makeNSView(context: Context) -> VisibilityTrackingView {
+        let view = VisibilityTrackingView()
+        view.onVisibilityChange = onVisibilityChange
+        return view
+    }
+
+    func updateNSView(_ nsView: VisibilityTrackingView, context: Context) {
+        nsView.onVisibilityChange = onVisibilityChange
+        DispatchQueue.main.async { [weak nsView] in
+            nsView?.evaluateVisibility()
+        }
+    }
+
+    final class VisibilityTrackingView: NSView {
+        var onVisibilityChange: (@MainActor (Bool) -> Void)?
+        private var windowObservers: [NSObjectProtocol] = []
+        private var lastReportedVisibility: Bool?
+
+        deinit {
+            clearObservers()
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            clearObservers()
+
+            guard let window else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.reportVisibility(false)
+                }
+                return
+            }
+
+            let center = NotificationCenter.default
+            windowObservers = [
+                center.addObserver(
+                    forName: NSWindow.didChangeOcclusionStateNotification,
+                    object: window,
+                    queue: .main
+                ) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        self?.evaluateVisibility()
+                    }
+                },
+                center.addObserver(
+                    forName: NSWindow.didBecomeKeyNotification,
+                    object: window,
+                    queue: .main
+                ) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        self?.evaluateVisibility()
+                    }
+                },
+                center.addObserver(
+                    forName: NSWindow.didResignKeyNotification,
+                    object: window,
+                    queue: .main
+                ) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        self?.evaluateVisibility()
+                    }
+                    // MenuBarExtra panels often orderOut immediately after resigning key.
+                    DispatchQueue.main.async { [weak self] in
+                        self?.evaluateVisibility()
+                    }
+                },
+                center.addObserver(
+                    forName: NSWindow.willCloseNotification,
+                    object: window,
+                    queue: .main
+                ) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        self?.reportVisibility(false)
+                    }
+                }
+            ]
+
+            DispatchQueue.main.async { [weak self] in
+                self?.evaluateVisibility()
+            }
+        }
+
+        func evaluateVisibility() {
+            guard let window else {
+                reportVisibility(false)
+                return
+            }
+            let isVisible = window.isVisible && window.occlusionState.contains(.visible)
+            reportVisibility(isVisible)
+        }
+
+        private func reportVisibility(_ isVisible: Bool) {
+            guard lastReportedVisibility != isVisible else { return }
+            lastReportedVisibility = isVisible
+            if isVisible && !NSApp.isActive {
+                NSApp.activate()
+            }
+            MainActor.assumeIsolated {
+                onVisibilityChange?(isVisible)
+            }
+        }
+
+        private func clearObservers() {
+            let center = NotificationCenter.default
+            for observer in windowObservers {
+                center.removeObserver(observer)
+            }
+            windowObservers.removeAll()
+        }
     }
 }

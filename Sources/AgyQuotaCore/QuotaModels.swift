@@ -148,6 +148,12 @@ public enum RefreshIntervalOption: Int, CaseIterable, Identifiable, Sendable {
     public var seconds: TimeInterval? {
         rawValue > 0 ? TimeInterval(rawValue) : nil
     }
+
+    /// Timer leeway (15% of interval, capped at 60s) allowing macOS to coalesce wakeups.
+    public var toleranceSeconds: TimeInterval? {
+        guard let seconds else { return nil }
+        return min(seconds * 0.15, 60)
+    }
 }
 
 /// A single quota window (e.g., 5-Hour Limit or Weekly Limit) for a category.

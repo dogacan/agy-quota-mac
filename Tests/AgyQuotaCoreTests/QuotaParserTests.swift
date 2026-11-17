@@ -132,4 +132,36 @@ final class QuotaParserTests: XCTestCase {
         XCTAssertTrue(weeklySummary.contains("Nov 21, 1:05 PM"), "Expected 'Nov 21, 1:05 PM' in '\(weeklySummary)'")
         XCTAssertFalse(weeklySummary.contains("T21:05:07Z"), "Unexpected raw UTC string in '\(weeklySummary)'")
     }
+
+    func testRefreshIntervalToleranceSeconds() {
+        XCTAssertEqual(RefreshIntervalOption.oneMinute.toleranceSeconds, 9)
+        XCTAssertEqual(RefreshIntervalOption.fiveMinutes.toleranceSeconds, 45)
+        XCTAssertEqual(RefreshIntervalOption.fifteenMinutes.toleranceSeconds, 60)
+        XCTAssertEqual(RefreshIntervalOption.thirtyMinutes.toleranceSeconds, 60)
+        XCTAssertNil(RefreshIntervalOption.manual.toleranceSeconds)
+    }
+
+    func testFetchSnapshotWithUtilityQoSExecutesBinary() async throws {
+        let scriptURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mock-agy-\(UUID().uuidString).sh")
+        let scriptContents = """
+        #!/bin/sh
+        echo "Quota:"
+        echo "Gemini Models          Five Hour Limit Remaining  88%   2026-11-14 18:05 PST"
+        echo "Claude and GPT models  Weekly Limit Remaining     92%   2026-11-21 15:16 PST"
+        """
+        try scriptContents.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+        defer { try? FileManager.default.removeItem(at: scriptURL) }
+
+        let result = try await AgyRunner().fetchSnapshot(
+            customBinaryPath: scriptURL.path,
+            timeoutSeconds: 5,
+            qos: .utility
+        )
+
+        XCTAssertEqual(result.resolvedBinaryPath, scriptURL.path)
+        XCTAssertEqual(result.snapshot.gemini?.fiveHour?.roundedPercent, 88)
+        XCTAssertEqual(result.snapshot.thirdParty?.weekly?.roundedPercent, 92)
+    }
 }

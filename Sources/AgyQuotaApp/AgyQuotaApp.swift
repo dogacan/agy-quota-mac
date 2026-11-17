@@ -17,13 +17,7 @@ struct AgyQuotaApp: App {
         MenuBarExtra {
             QuotaPopoverView(viewModel: viewModel)
         } label: {
-            let icon = MenuBarIconRenderer.render(
-                snapshot: viewModel.snapshot,
-                style: viewModel.menuBarStyle,
-                metric: viewModel.menuBarMetric,
-                monochrome: viewModel.monochromeIcons
-            )
-            Image(nsImage: icon)
+            Image(nsImage: viewModel.menuBarIcon)
                 .renderingMode(viewModel.monochromeIcons ? .template : .original)
         }
         .menuBarExtraStyle(.window)

@@ -14,7 +14,18 @@ final class QuotaViewModel: ObservableObject {
         static let customAgyPath = "customAgyPath"
     }
 
-    @Published private(set) var snapshot: QuotaSnapshot?
+    private struct MenuBarIconKey: Equatable {
+        let geminiPercent: Int?
+        let thirdPartyPercent: Int?
+        let style: MenuBarStyle
+        let monochrome: Bool
+    }
+
+    @Published private(set) var snapshot: QuotaSnapshot? {
+        didSet {
+            updateMenuBarIconIfNeeded()
+        }
+    }
     @Published private(set) var isRefreshing: Bool = false
     @Published private(set) var lastError: String?
     @Published private(set) var resolvedBinaryPath: String?
@@ -22,22 +33,26 @@ final class QuotaViewModel: ObservableObject {
     @Published private(set) var now: Date = Date()
     @Published private(set) var launchAtLoginEnabled: Bool = false
     @Published private(set) var launchAtLoginError: String?
+    @Published private(set) var menuBarIcon: NSImage
 
     @Published var menuBarStyle: MenuBarStyle {
         didSet {
             UserDefaults.standard.set(menuBarStyle.rawValue, forKey: DefaultsKey.menuBarStyle)
+            updateMenuBarIconIfNeeded()
         }
     }
 
     @Published var menuBarMetric: MenuBarMetric {
         didSet {
             UserDefaults.standard.set(menuBarMetric.rawValue, forKey: DefaultsKey.menuBarMetric)
+            updateMenuBarIconIfNeeded()
         }
     }
 
     @Published var monochromeIcons: Bool {
         didSet {
             UserDefaults.standard.set(monochromeIcons, forKey: DefaultsKey.monochromeIcons)
+            updateMenuBarIconIfNeeded()
         }
     }
 
@@ -58,42 +73,65 @@ final class QuotaViewModel: ObservableObject {
     private var pollingTask: Task<Void, Never>?
     private var clockTask: Task<Void, Never>?
     private var wakeObserver: NSObjectProtocol?
+    private var lastIconKey: MenuBarIconKey
+    private var isPopoverVisible: Bool = false
 
     init() {
         let defaults = UserDefaults.standard
 
+        let initialStyle: MenuBarStyle
         if let rawStyle = defaults.string(forKey: DefaultsKey.menuBarStyle),
            let parsedStyle = MenuBarStyle(rawValue: rawStyle) {
-            self.menuBarStyle = parsedStyle
+            initialStyle = parsedStyle
         } else {
-            self.menuBarStyle = .ringsAndPercent
+            initialStyle = .ringsAndPercent
         }
 
+        let initialMetric: MenuBarMetric
         if let rawMetric = defaults.string(forKey: DefaultsKey.menuBarMetric),
            let parsedMetric = MenuBarMetric(rawValue: rawMetric) {
-            self.menuBarMetric = parsedMetric
+            initialMetric = parsedMetric
         } else {
-            self.menuBarMetric = .lowest
+            initialMetric = .lowest
         }
 
-        self.monochromeIcons = defaults.object(forKey: DefaultsKey.monochromeIcons) as? Bool ?? false
+        let initialMonochrome = defaults.object(forKey: DefaultsKey.monochromeIcons) as? Bool ?? false
 
+        let initialRefreshInterval: RefreshIntervalOption
         if defaults.object(forKey: DefaultsKey.refreshInterval) != nil {
             let storedSeconds = defaults.integer(forKey: DefaultsKey.refreshInterval)
-            self.refreshInterval = RefreshIntervalOption(rawValue: storedSeconds) ?? .fiveMinutes
+            initialRefreshInterval = RefreshIntervalOption(rawValue: storedSeconds) ?? .fiveMinutes
         } else {
-            self.refreshInterval = .fiveMinutes
+            initialRefreshInterval = .fiveMinutes
         }
 
-        self.customAgyPath = defaults.string(forKey: DefaultsKey.customAgyPath) ?? ""
+        let initialCustomPath = defaults.string(forKey: DefaultsKey.customAgyPath) ?? ""
+
+        self.menuBarStyle = initialStyle
+        self.menuBarMetric = initialMetric
+        self.monochromeIcons = initialMonochrome
+        self.refreshInterval = initialRefreshInterval
+        self.customAgyPath = initialCustomPath
         self.launchAtLoginEnabled = Self.currentLaunchAtLoginState()
 
-        startClockTicker()
+        self.lastIconKey = MenuBarIconKey(
+            geminiPercent: nil,
+            thirdPartyPercent: nil,
+            style: initialStyle,
+            monochrome: initialMonochrome
+        )
+        self.menuBarIcon = MenuBarIconRenderer.render(
+            snapshot: nil,
+            style: initialStyle,
+            metric: initialMetric,
+            monochrome: initialMonochrome
+        )
+
         observeSystemWake()
         reschedulePolling()
 
-        Task { [weak self] in
-            await self?.refresh()
+        Task(priority: .utility) { [weak self] in
+            await self?.refresh(isUserInitiated: false)
         }
     }
 
@@ -106,19 +144,32 @@ final class QuotaViewModel: ObservableObject {
     }
 
     /// Manually or programmatically triggers an `agy --print "/quota"` refresh.
-    func refresh() async {
+    func refresh(isUserInitiated: Bool = true) async {
         guard !isRefreshing else { return }
         isRefreshing = true
         defer { isRefreshing = false }
 
         do {
-            let result = try await runner.fetchSnapshot(customBinaryPath: customAgyPath)
+            let qos: QualityOfService = isUserInitiated ? .userInitiated : .utility
+            let result = try await runner.fetchSnapshot(customBinaryPath: customAgyPath, qos: qos)
             snapshot = result.snapshot
             resolvedBinaryPath = result.resolvedBinaryPath
             lastError = nil
             now = Date()
         } catch {
             lastError = error.localizedDescription
+        }
+    }
+
+    /// Starts or stops the relative-timestamp clock ticker based on whether the popover window is on screen.
+    func setPopoverVisible(_ isVisible: Bool) {
+        guard isPopoverVisible != isVisible else { return }
+        isPopoverVisible = isVisible
+        if isVisible {
+            now = Date()
+            startClockTicker()
+        } else {
+            stopClockTicker()
         }
     }
 
@@ -169,24 +220,47 @@ final class QuotaViewModel: ObservableObject {
             return
         }
 
-        pollingTask = Task { [weak self] in
+        let tolerance = refreshInterval.toleranceSeconds ?? 0
+        pollingTask = Task(priority: .utility) { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(interval))
+                try? await Task.sleep(for: .seconds(interval), tolerance: .seconds(tolerance))
                 guard !Task.isCancelled else { break }
-                await self?.refresh()
+                await self?.refresh(isUserInitiated: false)
             }
         }
     }
 
     private func startClockTicker() {
         clockTask?.cancel()
-        clockTask = Task { [weak self] in
+        clockTask = Task(priority: .utility) { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(30))
+                try? await Task.sleep(for: .seconds(30), tolerance: .seconds(5))
                 guard !Task.isCancelled else { break }
                 self?.now = Date()
             }
         }
+    }
+
+    private func stopClockTicker() {
+        clockTask?.cancel()
+        clockTask = nil
+    }
+
+    private func updateMenuBarIconIfNeeded() {
+        let newKey = MenuBarIconKey(
+            geminiPercent: snapshot?.gemini?.percent(for: menuBarMetric),
+            thirdPartyPercent: snapshot?.thirdParty?.percent(for: menuBarMetric),
+            style: menuBarStyle,
+            monochrome: monochromeIcons
+        )
+        guard newKey != lastIconKey else { return }
+        lastIconKey = newKey
+        menuBarIcon = MenuBarIconRenderer.render(
+            snapshot: snapshot,
+            style: menuBarStyle,
+            metric: menuBarMetric,
+            monochrome: monochromeIcons
+        )
     }
 
     private func observeSystemWake() {
@@ -195,8 +269,8 @@ final class QuotaViewModel: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                await self?.refresh()
+            Task(priority: .utility) { @MainActor [weak self] in
+                await self?.refresh(isUserInitiated: false)
             }
         }
     }

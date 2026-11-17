@@ -65,7 +65,8 @@ public struct AgyRunner: Sendable {
     /// Runs `agy --print "/quota"` and parses the resulting snapshot.
     public func fetchSnapshot(
         customBinaryPath: String? = nil,
-        timeoutSeconds: Int = 30
+        timeoutSeconds: Int = 30,
+        qos: QualityOfService = .userInitiated
     ) async throws -> (snapshot: QuotaSnapshot, resolvedBinaryPath: String) {
         if let mockOutput = ProcessInfo.processInfo.environment[Self.mockOutputEnvKey],
            !mockOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -73,11 +74,12 @@ public struct AgyRunner: Sendable {
             return (snapshot, "env:\(Self.mockOutputEnvKey)")
         }
 
-        let binaryPath = try await resolveBinaryPath(customBinaryPath: customBinaryPath)
+        let binaryPath = try await resolveBinaryPath(customBinaryPath: customBinaryPath, qos: qos)
         let result = try await runProcess(
             executablePath: binaryPath,
             arguments: ["--print", "/quota"],
-            timeoutSeconds: timeoutSeconds
+            timeoutSeconds: timeoutSeconds,
+            qos: qos
         )
 
         if let snapshot = try? QuotaParser.parse(result.stdout) {
@@ -93,7 +95,7 @@ public struct AgyRunner: Sendable {
         return (snapshot, binaryPath)
     }
 
-    private func resolveBinaryPath(customBinaryPath: String?) async throws -> String {
+    private func resolveBinaryPath(customBinaryPath: String?, qos: QualityOfService) async throws -> String {
         let fileManager = FileManager.default
         let candidates = Self.candidateBinaryPaths(customBinaryPath: customBinaryPath)
 
@@ -105,7 +107,8 @@ public struct AgyRunner: Sendable {
         if let shellResult = try? await runProcess(
             executablePath: "/bin/zsh",
             arguments: ["-lic", "command -v agy"],
-            timeoutSeconds: 5
+            timeoutSeconds: 5,
+            qos: qos
         ), shellResult.exitCode == 0 {
             let resolved = shellResult.stdout
                 .components(separatedBy: .newlines)
@@ -122,14 +125,17 @@ public struct AgyRunner: Sendable {
     private func runProcess(
         executablePath: String,
         arguments: [String],
-        timeoutSeconds: Int
+        timeoutSeconds: Int,
+        qos: QualityOfService
     ) async throws -> ProcessOutput {
         let env = Self.enrichedEnvironment(forExecutable: executablePath)
+        let dispatchQoS = Self.dispatchQoS(for: qos)
         return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
+            DispatchQueue.global(qos: dispatchQoS).async {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: executablePath)
                 process.arguments = arguments
+                process.qualityOfService = qos
                 // Avoid workspace indexing or TCC Desktop/Documents prompts from Finder-launched apps.
                 process.currentDirectoryURL = FileManager.default.temporaryDirectory
                 process.environment = env
@@ -236,6 +242,23 @@ public struct AgyRunner: Sendable {
         env["NO_COLOR"] = "1"
         env["TERM"] = "dumb"
         return env
+    }
+
+    private static func dispatchQoS(for qos: QualityOfService) -> DispatchQoS.QoSClass {
+        switch qos {
+        case .userInteractive:
+            return .userInteractive
+        case .userInitiated:
+            return .userInitiated
+        case .utility:
+            return .utility
+        case .background:
+            return .background
+        case .default:
+            return .default
+        @unknown default:
+            return .utility
+        }
     }
 }
 
